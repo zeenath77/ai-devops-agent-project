@@ -1,0 +1,90 @@
+name: Terraform AI Review Agent
+
+on:
+  pull_request:
+    paths:
+      - "ai-devops-agent-main/terraform-review-agent/**"
+
+jobs:
+  terraform-ai-review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Install Terrascan
+        run: |
+          curl -L https://github.com/tenable/terrascan/releases/download/v1.18.3/terrascan_1.18.3_Linux_x86_64.tar.gz | tar -xz
+          sudo mv terrascan /usr/local/bin/
+          terrascan version
+
+      - name: Initialize Terrascan
+        run: terrascan init
+
+      - name: Run Terrascan Scan
+        run: |
+          terrascan scan \
+            -i terraform \
+            -d ai-devops-agent-main/terraform-review-agent/terraform \
+            -t aws \
+            -o json \
+            > terrascan_report.json
+
+      - name: Invoke AI Review Lambda
+        id: ai_review
+        run: |
+          aws lambda invoke \
+            --function-name terraform-ai-review-agent \
+            --cli-binary-format raw-in-base64-out \
+            --payload file://terrascan_report.json \
+            response.json
+
+          echo "AI RESPONSE:"
+          cat response.json
+
+      - name: Extract AI Suggestions
+        id: extract
+        run: |
+          AI_REVIEW=$(jq -r '.ai_review' response.json)
+          VERDICT=$(jq -r '.verdict' response.json)
+
+          echo "ai_review=$AI_REVIEW" >> $GITHUB_OUTPUT
+          echo "verdict=$VERDICT" >> $GITHUB_OUTPUT
+
+      - name: Comment AI Suggestions on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const review = `${{ steps.extract.outputs.ai_review }}`;
+            const verdict = `${{ steps.extract.outputs.verdict }}`;
+
+            const message = `
+            ## 🤖 Terraform AI Review
+
+            **Verdict:** ${verdict}
+
+            **AI Suggestions:**
+            ${review}
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: message
+            });
+
+      - name: Fail PR if AI Rejects
+        run: |
+          if [ "${{ steps.extract.outputs.verdict }}" == "REJECT" ]; then
+            echo "Terraform rejected by AI"
+            exit 1
+          fi
